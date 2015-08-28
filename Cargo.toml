@@ -1,0 +1,8 @@
+[package]
+name = "kindlepaper"
+version = "0.1.0"
+authors = ["Andreas From <andro.from@gmail.com>"]
+
+[dependencies]
+rust-sqlite = "0.2.0"
+time = "0.1"
