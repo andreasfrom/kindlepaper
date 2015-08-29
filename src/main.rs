@@ -16,7 +16,7 @@ use time::now;
 
 const DATE_FMT: &'static str = "%F"; // ISO 8601
 
-const OUT: &'static str = "out";
+const OUT: &'static str = "papers";
 const TOC_FILE: &'static str = "toc.html";
 const CONTENT_FILE: &'static str = "content.html";
 
@@ -69,6 +69,10 @@ fn main() {
     convert_papers(&papers).unwrap();
 }
 
+fn date_paper(name: &str) -> String {
+    format!("{} - {}", name, now().strftime(DATE_FMT).unwrap())
+}
+
 fn convert_papers(papers: &[Config]) -> Result<(), Error> {
     let dir = temp_dir().join("apps");
 
@@ -82,11 +86,13 @@ fn convert_papers(papers: &[Config]) -> Result<(), Error> {
 
             let articles = fetch_articles(&db.to_string_lossy(), &paper.select_stmt).unwrap();
 
-            try!(write_toc(&articles));
-            try!(write_articles(&articles, &paper.name));
-            try!(write_opf(&paper.name));
+            let name = date_paper(&paper.name);
 
-            kindlegen(&paper.name);
+            try!(write_toc(&articles));
+            try!(write_articles(&articles, &name));
+            try!(write_opf(&name));
+
+            kindlegen(&name);
         }
     }
 
@@ -135,8 +141,8 @@ fn kindlegen(name: &str) {
     fs::rename(temp_dir().join(&out), Path::new(OUT).join(&out)).unwrap();
 }
 
-fn make_name(s: &str) -> String {
-    s.replace(" ", "_")
+fn make_name(s: &str, idx: usize) -> String {
+    format!("{}_{}", s.replace(" ", "_"), idx)
 }
 
 fn write_toc(articles: &[Article]) -> Result<(), Error> {
@@ -153,8 +159,9 @@ fn write_toc(articles: &[Article]) -> Result<(), Error> {
     try!(f.write_all(b"<nav epub:type=\"toc\">"));
     try!(f.write_all(b"<ol>"));
 
-    for a in articles.iter().filter(|a| a.title != "") {
-        try!(write!(f, "<li><a href=\"{}#{}\">{}</a></li>", CONTENT_FILE, make_name(&a.title), a.title));
+    for (idx, a) in articles.iter() .enumerate() {
+        if a.title == "" {continue}
+        try!(write!(f, "<li><a href=\"{}#{}\">{}</a></li>", CONTENT_FILE, make_name(&a.title, idx), a.title));
     }
 
     try!(f.write_all(b"</ol>"));
@@ -177,11 +184,11 @@ fn write_articles(articles: &[Article], title: &str) -> Result<(), Error> {
     try!(f.write_all(b"</head>"));
     try!(f.write_all(b"<body>"));
 
-    for a in articles {
+    for (idx, a) in articles.iter().enumerate() {
         try!(f.write_all(b"<article>"));
 
         try!(f.write_all(b"<header><div>"));
-        try!(write!(f, "<a name=\"{}\"><h1>{}</h1></a>", make_name(&a.title), a.title));
+        try!(write!(f, "<a name=\"{}\"><h1>{}</h1></a>", make_name(&a.title, idx), a.title));
         try!(write!(f, "<h2>{}</h2>", a.blurb));
         try!(f.write_all(b"</div></header>"));
 
@@ -277,6 +284,7 @@ fn write_opf(title: &str) -> Result<(), Error> {
     <item id=\"content\" media-type=\"text/html\" href=\"{}\"></item>
   </manifest>
   <spine toc=\"toc\">
+    <itemref idref=\"toc\"/>
     <itemref idref=\"content\"/>
   </spine>
   <guide>
