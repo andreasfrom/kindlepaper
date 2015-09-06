@@ -1,12 +1,16 @@
 extern crate sqlite3;
 extern crate time;
+extern crate ssh2;
 
 use std::io::prelude::*;
 use std::io::Error;
 use std::fs::{self, File, metadata, create_dir};
 use std::path::Path;
 use std::process::Command;
-use std::env::temp_dir;
+use std::env::{args, temp_dir};
+
+use std::net::TcpStream;
+use ssh2::Session;
 
 use sqlite3::{DatabaseConnection, Query, ResultRowAccess, SqliteResult};
 use sqlite3::access::open;
@@ -23,6 +27,10 @@ const CONTENT_FILE: &'static str = "content.html";
 const EXTRACT_SCRIPT: &'static [u8; 122] =
     b"dd if=$1 bs=1 skip=24 | python -c \"import zlib,sys;sys.stdout.write(zlib.decompress(sys.stdin.read()))\" | tar -xvf - -C $2";
 
+const IPAD_IP: &'static str = "192.168.1.109:22";
+const IPAD_USER: &'static str = "root";
+const IPAD_PASSWORD: &'static str = "alpine";
+
 #[derive(Debug)]
 struct Article {
     title: String,
@@ -36,36 +44,60 @@ struct Config {
     name: String,
     app_id: String,
     select_stmt: String,
+    refid_stmt: String,
 }
 
 impl Config {
-    fn new(name: &str, app_id: &str, select_stmt: &str) -> Config {
+    fn new(name: &str, app_id: &str, select_stmt: &str, refid_stmt: &str) -> Config {
         Config {
             name: name.to_string(),
             app_id: app_id.to_string(),
             select_stmt: select_stmt.to_string(),
+            refid_stmt: refid_stmt.to_string(),
         }
     }
 }
 
 fn main() {
-    let papers = vec![
+    let mut args = args();
+    let ipad = args.len() > 1 && args.nth(1) == Some("ipad".to_string());
+    let papers;
+
+    if ipad {
+    papers = vec![
         Config::new(
             "Politiken",
-            "dk.politiken.reader",
-            "SELECT title, byline, blurb, content FROM articles WHERE refid LIKE ?"),
+            "4C1B6602-BAFD-4582-8A9F-1B956C8C4D93",
+            "SELECT ZTITLE AS title, ZBYLINE AS byline, ZBLURB AS blurb, ZCONTENT AS content FROM ZARTICLE WHERE ZREFID LIKE ? ORDER BY ZORIGINPAGE, ZREFID",
+            "SELECT ZREFID AS refid FROM ZARTICLE ORDER BY Z_PK DESC LIMIT 1"),
 
         Config::new(
             "Information",
-            "dk.information.areader",
-            "SELECT title, author AS byline, blurb, content FROM articles LEFT JOIN byline ON articles.article_id == byline.article_id WHERE refid LIKE ?")
+            "9597F96C-52F4-4467-8D6F-5CC515FACE1E",
+            "SELECT ZTITLE AS title, ZAUTHOR AS byline, ZBLURB AS blurb, ZCONTENT AS content FROM ZARTICLE LEFT JOIN ZBYLINE ON ZARTICLE.Z_PK == ZBYLINE.ZARTICLE WHERE ZREFID LIKE ? ORDER BY ZORIGINPAGE, ZREFID",
+            "SELECT ZREFID AS refid FROM ZARTICLE ORDER BY Z_PK DESC LIMIT 1"),
         ];
 
-    let ids: Vec<&str> = papers.iter().map(|p| &*p.app_id).collect();
+        fetch_data_from_ipad(&papers).unwrap();
+    } else {
+        papers = vec![
+            Config::new(
+                "Politiken",
+                "dk.politiken.reader",
+                "SELECT title, byline, blurb, content FROM articles WHERE refid LIKE ?",
+                "SELECT refid FROM articles ORDER BY article_id DESC LIMIT 1"),
+
+            Config::new(
+                "Information",
+                "dk.information.areader",
+                "SELECT title, author AS byline, blurb, content FROM articles LEFT JOIN byline ON articles.article_id == byline.article_id WHERE refid LIKE ?",
+                "SELECT refid FROM articles ORDER BY article_id DESC LIMIT 1"),
+            ];
+
+        fetch_data_from_android(&papers).unwrap();
+    }
 
     create_dir(OUT).ok();
-
-    fetch_data_from_android(&ids).unwrap();
     convert_papers(&papers).unwrap();
 }
 
@@ -74,17 +106,10 @@ fn date_paper(name: &str) -> String {
 }
 
 fn convert_papers(papers: &[Config]) -> Result<(), Error> {
-    let dir = temp_dir().join("apps");
-
     for paper in papers {
-        let path = dir.join(Path::new(&paper.app_id));
-        if is_dir(&path) {
-            let db = dir
-                .join(Path::new(&paper.app_id))
-                .join(Path::new("db"))
-                .join(Path::new("data").with_extension("db"));
-
-            let articles = fetch_articles(&db.to_string_lossy(), &paper.select_stmt).unwrap();
+        let db = temp_dir().join(Path::new(&paper.name).with_extension("db"));
+        if is_file(&db) {
+            let articles = fetch_articles(&db.to_string_lossy(), &paper.select_stmt, &paper.refid_stmt).unwrap();
 
             let name = date_paper(&paper.name);
 
@@ -99,15 +124,16 @@ fn convert_papers(papers: &[Config]) -> Result<(), Error> {
     Ok(())
 }
 
-fn fetch_data_from_android(app_ids: &[&str]) -> Result<(), Error> {
+fn fetch_data_from_android(papers: &[Config]) -> Result<(), Error> {
     let path = temp_dir().join(Path::new("papers").with_extension("ab"));
+    let ids: Vec<&str> = papers.iter().map(|p| &*p.app_id).collect();
 
     Command::new("adb")
         .arg("backup")
         .arg("-f")
         .arg(&path)
         .arg("-noapk")
-        .args(app_ids)
+        .args(&ids)
         .status()
         .unwrap_or_else(|e| { panic!("failed to execute process: {}", e) });
 
@@ -122,16 +148,54 @@ fn fetch_data_from_android(app_ids: &[&str]) -> Result<(), Error> {
         .arg(&temp_dir())
         .status().unwrap();
 
+    // TODO: Testing
+    for paper in papers {
+        let db = temp_dir()
+            .join(Path::new("apps"))
+            .join(Path::new(&paper.app_id))
+            .join(Path::new("db"))
+            .join(Path::new("data").with_extension("db"));
+
+        let out = temp_dir().join(&paper.name).with_extension("db");
+
+        try!(fs::rename(db, out));
+    }
+
     Ok(())
 }
 
-fn is_dir(path: &Path) -> bool {
-    metadata(path).map(|m| m.is_dir()).unwrap_or(false)
+fn fetch_data_from_ipad(papers: &[Config]) -> Result<(), Error> {
+    let tcp = TcpStream::connect(IPAD_IP).unwrap();
+    let mut sess = Session::new().unwrap();
+    sess.handshake(&tcp).unwrap();
+    sess.userauth_password(IPAD_USER, IPAD_PASSWORD).unwrap();
+
+    for paper in papers {
+        let out = temp_dir().join(&paper.name).with_extension("db");
+        let remote =
+            Path::new("/var/mobile/Applications")
+            .join(Path::new(&paper.app_id))
+            .join(Path::new("Documents/Reader.sqlite"));
+
+        let (mut remote_file, _) = sess.scp_recv(&remote).unwrap();
+        let mut contents = Vec::new();
+        remote_file.read_to_end(&mut contents).unwrap();
+
+        let mut f = try!(File::create(out));
+        try!(f.write_all(&contents));
+    }
+
+    Ok(())
+}
+
+fn is_file(path: &Path) -> bool {
+    metadata(path).map(|m| m.is_file()).unwrap_or(false)
 }
 
 fn kindlegen(name: &str) {
     let file = temp_dir().join(Path::new(name).with_extension("opf"));
     let out = Path::new(name).with_extension("mobi");
+    println!("{}", out.display());
 
     Command::new("kindlegen")
         .arg(file)
@@ -224,9 +288,8 @@ fn write_articles(articles: &[Article], title: &str) -> Result<(), Error> {
     Ok(())
 }
 
-fn fetch_refid_pattern(conn: &DatabaseConnection) -> SqliteResult<String> {
-    let mut last_refid_stmt = try!(conn.prepare(
-        "SELECT refid FROM articles ORDER BY article_id DESC LIMIT 1"));
+fn fetch_refid_pattern(conn: &DatabaseConnection, refid_stmt: &str) -> SqliteResult<String> {
+    let mut last_refid_stmt = try!(conn.prepare(refid_stmt));
 
     let refid: String;
 
@@ -242,10 +305,10 @@ fn fetch_refid_pattern(conn: &DatabaseConnection) -> SqliteResult<String> {
     Ok(sub_refid + "%")
 }
 
-fn fetch_articles(db_file: &str, select_stmt: &str) -> SqliteResult<Vec<Article>> {
+fn fetch_articles(db_file: &str, select_stmt: &str, refid_stmt: &str) -> SqliteResult<Vec<Article>> {
     let conn = try!(open(db_file, None));
 
-    let pattern = try!(fetch_refid_pattern(&conn));
+    let pattern = try!(fetch_refid_pattern(&conn, refid_stmt));
 
     let mut stmt = try!(conn.prepare(select_stmt));
 

@@ -6,3 +6,4 @@ authors = ["Andreas From <andro.from@gmail.com>"]
 [dependencies]
 rust-sqlite = "0.2.0"
 time = "0.1"
+ssh2 = "0.2"
